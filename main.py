@@ -2,9 +2,12 @@
 main.py — نقطة الدخول الرئيسية للبوت
 
 تحسينات v2:
-  - إضافة معالج زر "اختبار جديد" (restart_quiz)
-  - error handler محسّن مع معلومات أكثر
-  - graceful shutdown
+- إضافة معالج زر "اختبار جديد" (restart_quiz)
+- error handler محسّن مع معلومات أكثر
+- graceful shutdown
+
+تحسينات v3:
+- إضافة زر "أسئلة جديدة بنفس الملف" (retry_same_pdf)
 """
 import logging
 import os
@@ -34,6 +37,7 @@ from handlers.quiz import (
     receive_pdf,
     receive_subject,
     restart_from_button,
+    retry_same_pdf_handler,      # ← جديد
 )
 from handlers.reports import reports
 from handlers.start import start
@@ -80,8 +84,10 @@ def main() -> None:
     quiz_conv = ConversationHandler(
         entry_points=[
             CommandHandler("newquiz", new_quiz),
-            # زر "اختبار جديد" من نهاية الاختبار يُعيد تشغيل المحادثة
+            # زر "اختبار جديد" من نهاية الاختبار يُعيد تشغيل المحادثة من البداية
             CallbackQueryHandler(restart_from_button, pattern=r"^restart_quiz$"),
+            # ✅ زر "أسئلة جديدة بنفس الملف" — يتجاوز مرحلة الـ PDF ويولّد أسئلة جديدة
+            CallbackQueryHandler(retry_same_pdf_handler, pattern=r"^retry_same_pdf$"),
         ],
         states={
             SUBJECT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_subject)],
@@ -97,14 +103,15 @@ def main() -> None:
     )
 
     # ─── Handlers ─────────────────────────────────────────────────────────────
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("help",    help_command))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reports", reports))
     app.add_handler(quiz_conv)
-    app.add_handler(CommandHandler("cancel",  cancel_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # معالج الأزرار خارج المحادثة (مثل restart_quiz بعد انتهاء ConversationHandler)
-    app.add_handler(CallbackQueryHandler(restart_from_button, pattern=r"^restart_quiz$"))
+    # معالج الأزرار خارج المحادثة (بعد انتهاء ConversationHandler)
+    app.add_handler(CallbackQueryHandler(restart_from_button,    pattern=r"^restart_quiz$"))
+    app.add_handler(CallbackQueryHandler(retry_same_pdf_handler, pattern=r"^retry_same_pdf$"))  # ← جديد
 
     app.add_error_handler(error_handler)
 
