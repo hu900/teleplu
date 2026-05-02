@@ -1,27 +1,33 @@
 """
-handlers/quiz.py — معالج الاختبار الكامل
+handlers/quiz.py — معالج محادثة الاختبار
 
-إصلاحات وتحسينات v2:
-  - [BUG FIX] _finish_quiz يحفظ user_id الصحيح (كان يحفظ chat_id)
-  - [BUG FIX] progress bar يعرض عدد صحيح من البلوكات (total بدلاً من total-1)
-  - [BUG FIX] cached PDF ينشئ chunks إذا لم تكن موجودة (مهم بعد فشل جلسة سابقة)
-  - زر "اختبار جديد" في نهاية الاختبار
-  - send_chat_action (typing...) أثناء المعالجة الطويلة
-  - عرض explanation بعد كل إجابة (إذا توفر)
-  - التحقق من طول اسم المادة
-  - دعم مجموعات Telegram (تحفظ user_id لا chat_id)
+الحالات:
+  SUBJECT        → المستخدم يكتب اسم المادة
+  PDF_WAIT       → المستخدم يرسل ملف PDF
+  QUESTION_COUNT → المستخدم يختار عدد الأسئلة
+  QUIZ           → المستخدم يجيب على الأسئلة
+
+تحسينات v3:
+- إضافة retry_same_pdf_handler: إعادة الاختبار بنفس الـ PDF وأسئلة جديدة
+  بدون الحاجة لإرسال الملف مجدداً.
+- حفظ pdf_text و language و subject و question_count في user_data
+  بعد معالجة الـ PDF لاستخدامها عند إعادة التشغيل.
+- زر "🔁 أسئلة جديدة بنفس الملف" يظهر في رسالة النتيجة النهائية.
 """
-import hashlib
 import logging
+import random
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
-from telegram.ext import ContextTypes, ConversationHandler
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
-import db
-from config import MAX_PDF_SIZE_MB, MAX_WRONG_SHOWN
-from services.chunk_service import prepare_chunks
-from services.language_service import detect_text_language, get_language_label
+from services.language_service import detect_language
 from services.pdf_service import extract_text_from_pdf
 from services.quiz_service import generate_questions
 
@@ -30,368 +36,363 @@ logger = logging.getLogger(__name__)
 # ─── States ───────────────────────────────────────────────────────────────────
 SUBJECT, PDF_WAIT, QUESTION_COUNT, QUIZ = range(4)
 
-# ─── /newquiz ─────────────────────────────────────────────────────────────────
+# ─── خيارات عدد الأسئلة المتاحة ──────────────────────────────────────────────
+QUESTION_COUNT_OPTIONS = [5, 10, 15, 20]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. بدء محادثة جديدة — /newquiz
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def new_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    db.save_user(user.id, user.username)
+    """نقطة الدخول: يطلب من المستخدم كتابة اسم المادة."""
     context.user_data.clear()
-    context.user_data["user_id"] = user.id  # ✅ FIX: تخزين ID الصحيح
-
     await update.message.reply_text(
         "📚 *اختبار جديد*\n\n"
-        "أرسل اسم المادة أو الموضوع الذي تريد الاختبار فيه:",
+        "اكتب اسم المادة أو الموضوع الذي تريد الاختبار فيه:",
         parse_mode="Markdown",
     )
     return SUBJECT
 
 
-# ─── استقبال اسم المادة ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. استقبال اسم المادة
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def receive_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """يحفظ اسم المادة ويطلب رفع ملف PDF."""
     subject = update.message.text.strip()
-
     if not subject:
-        await update.message.reply_text("⚠️ الاسم لا يمكن أن يكون فارغاً. أرسل اسم المادة:")
-        return SUBJECT
-
-    if len(subject) > 100:
-        await update.message.reply_text("⚠️ اسم المادة طويل جداً (الحد 100 حرف). أرسل اسماً أقصر:")
+        await update.message.reply_text("⚠️ يرجى كتابة اسم المادة.")
         return SUBJECT
 
     context.user_data["subject"] = subject
-
     await update.message.reply_text(
         f"✅ المادة: *{subject}*\n\n"
-        f"الآن أرسل ملف PDF للاختبار أو المحتوى التعليمي\n"
-        f"_(الحد الأقصى: {MAX_PDF_SIZE_MB} ميجابايت)_",
+        "أرسل ملف PDF الآن 📄",
         parse_mode="Markdown",
     )
     return PDF_WAIT
 
 
-# ─── استقبال ملف PDF ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. استقبال ملف PDF
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def receive_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """يستخرج النص من الـ PDF ويعرض خيارات عدد الأسئلة."""
     doc = update.message.document
 
-    if not (doc.mime_type == "application/pdf" or (doc.file_name or "").lower().endswith(".pdf")):
+    # التحقق من نوع الملف
+    if not doc.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("⚠️ يرجى إرسال ملف PDF فقط.")
         return PDF_WAIT
 
-    max_bytes = MAX_PDF_SIZE_MB * 1024 * 1024
-    if doc.file_size and doc.file_size > max_bytes:
-        await update.message.reply_text(
-            f"⚠️ الملف كبير جداً ({doc.file_size // (1024 * 1024)} ميجابايت).\n"
-            f"الحد الأقصى: {MAX_PDF_SIZE_MB} ميجابايت."
-        )
-        return PDF_WAIT
-
-    msg = await update.message.reply_text("⏳ جاري تحميل الملف...")
+    processing_msg = await update.message.reply_text("⏳ جارٍ معالجة الملف...")
 
     try:
-        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-
-        tg_file    = await doc.get_file()
-        file_bytes = bytes(await tg_file.download_as_bytearray())
-        file_hash  = hashlib.md5(file_bytes).hexdigest()
-
-        # ─── التحقق من الكاش ─────────────────────────────────────────────
-        cached = db.get_pdf_cache(file_hash)
-        if cached:
-            text       = cached["extracted_text"]
-            language   = cached["language"]
-            lang_label = get_language_label(language)
-            logger.info("📦 PDF من الكاش: %s", file_hash[:8])
-        else:
-            await msg.edit_text("⏳ جاري استخراج النص من PDF...")
-            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-
-            text = extract_text_from_pdf(file_bytes)
-
-            if not text or len(text.strip()) < 80:
-                await msg.edit_text(
-                    "❌ لم يتمكن من استخراج نص من الملف.\n\n"
-                    "تأكد أن الـ PDF يحتوي على نص قابل للنسخ وليس صوراً ممسوحة ضوئياً."
-                )
-                return PDF_WAIT
-
-            language   = detect_text_language(text)
-            lang_label = get_language_label(language)
-            db.upsert_pdf_cache(file_hash, doc.file_name, language, text)
-
-        # ─── إنشاء chunks (للجديد والكاش معاً) ──────────────────────────
-        # ✅ FIX: نتحقق دائماً وليس فقط للملفات الجديدة
-        if db.get_chunk_count(file_hash) == 0:
-            await msg.edit_text("⏳ جاري تحليل المحتوى وتقطيعه...")
-            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-            chunks = prepare_chunks(file_hash, text, language)
-            if chunks:
-                db.save_chunks(file_hash, chunks)
-                logger.info("✅ %d chunk للملف %s", len(chunks), file_hash[:8])
-
-        # ─── حفظ بيانات الجلسة ────────────────────────────────────────────
-        context.user_data["file_hash"] = file_hash
-        context.user_data["language"]  = language
-        context.user_data["file_name"] = doc.file_name or "ملف"
-
-        # ─── اختيار عدد الأسئلة ───────────────────────────────────────────
-        lang_label = get_language_label(language)
-        keyboard = [
-            [
-                InlineKeyboardButton("5️⃣  أسئلة",    callback_data="qcount|5"),
-                InlineKeyboardButton("🔟 أسئلة",     callback_data="qcount|10"),
-            ],
-            [
-                InlineKeyboardButton("1️⃣5️⃣ سؤالاً",  callback_data="qcount|15"),
-                InlineKeyboardButton("2️⃣0️⃣ سؤالاً",  callback_data="qcount|20"),
-            ],
-        ]
-        await msg.edit_text(
-            f"✅ *تم تحليل الملف بنجاح!*\n\n"
-            f"📄 {doc.file_name or 'الملف'}\n"
-            f"🌐 اللغة المكتشفة: {lang_label}\n\n"
-            f"كم سؤالاً تريد في الاختبار؟",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-        )
-        return QUESTION_COUNT
-
+        file = await doc.get_file()
+        file_bytes = await file.download_as_bytearray()
+        pdf_text = extract_text_from_pdf(bytes(file_bytes))
     except Exception as e:
-        logger.error("خطأ في معالجة PDF: %s", e, exc_info=True)
-        await msg.edit_text(
-            "❌ حدث خطأ أثناء معالجة الملف.\n"
-            "حاول مرة أخرى أو أرسل ملفاً مختلفاً."
+        logger.error("خطأ في استخراج النص من PDF: %s", e)
+        await processing_msg.edit_text("❌ تعذّر قراءة الملف. تأكد أنه PDF صحيح وحاول مجدداً.")
+        return PDF_WAIT
+
+    if not pdf_text or len(pdf_text.strip()) < 50:
+        await processing_msg.edit_text(
+            "⚠️ الملف لا يحتوي على نص كافٍ.\n"
+            "تأكد أن الـ PDF يحتوي على نص قابل للقراءة (ليس صورة فقط)."
         )
         return PDF_WAIT
 
+    # ── حفظ البيانات في user_data للاستخدام لاحقاً (retry_same_pdf) ──────────
+    language = detect_language(pdf_text)
+    context.user_data["pdf_text"]  = pdf_text
+    context.user_data["language"]  = language
+    # subject محفوظ مسبقاً في receive_subject
 
-# ─── اختيار عدد الأسئلة ──────────────────────────────────────────────────────
+    await processing_msg.edit_text(
+        f"✅ تم استخراج النص بنجاح!\n"
+        f"🌐 اللغة المكتشفة: {'عربي 🇸🇦' if language == 'arabic' else 'إنجليزي 🇬🇧'}\n\n"
+        "كم سؤالاً تريد في الاختبار؟"
+    )
+
+    # أزرار اختيار عدد الأسئلة
+    keyboard = [
+        [InlineKeyboardButton(f"{n} أسئلة", callback_data=f"qcount|{n}")]
+        for n in QUESTION_COUNT_OPTIONS
+    ]
+    await update.message.reply_text(
+        "اختر عدد الأسئلة:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return QUESTION_COUNT
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. اختيار عدد الأسئلة
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def choose_question_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """يحفظ عدد الأسئلة ويبدأ توليدها."""
     query = update.callback_query
     await query.answer()
 
-    count     = int(query.data.split("|")[1])
-    file_hash = context.user_data.get("file_hash", "")
-    language  = context.user_data.get("language", "arabic")
+    count = int(query.data.split("|")[1])
+    context.user_data["question_count"] = count
 
-    await query.edit_message_text(f"⏳ جاري توليد {count} سؤالاً...")
-    await context.bot.send_chat_action(query.message.chat_id, ChatAction.TYPING)
+    pdf_text = context.user_data.get("pdf_text", "")
+    language = context.user_data.get("language", "arabic")
 
-    try:
-        # جلب chunks (الأكثر تنوعاً حسب عدد الأسئلة)
-        chunks_limit = max(3, count // 3 + 2)
-        chunks = db.sample_chunks(file_hash, limit=chunks_limit)
+    await query.message.edit_text(f"⏳ جارٍ توليد {count} سؤال...")
 
-        if chunks:
-            text_content = "\n\n---\n\n".join(c["chunk_text"] for c in chunks)
-            db.mark_chunks_used([c["id"] for c in chunks])
-        else:
-            cached = db.get_pdf_cache(file_hash)
-            text_content = cached["extracted_text"] if cached else ""
+    questions = await generate_questions(
+        text_content=pdf_text,
+        count=count,
+        language=language,
+    )
 
-        if not text_content:
-            await query.edit_message_text("❌ لم يُعثر على محتوى. حاول رفع الملف مجدداً.")
-            return ConversationHandler.END
-
-        questions = await generate_questions(text_content, count=count, language=language)
-
-        if not questions:
-            await query.edit_message_text(
-                "❌ تعذّر توليد الأسئلة من هذا المحتوى.\n"
-                "تأكد أن الملف يحتوي على محتوى تعليمي كافٍ."
-            )
-            return ConversationHandler.END
-
-        context.user_data["questions"]   = questions
-        context.user_data["current_idx"] = 0
-        context.user_data["score"]       = 0
-        context.user_data["wrong"]       = []
-
-        actual = len(questions)
-        note   = f" _(وجدنا {actual} سؤالاً فقط)_" if actual < count else ""
-        await query.edit_message_text(
-            f"✅ تم توليد *{actual}* سؤالاً!{note}\n\n"
-            f"يبدأ الاختبار الآن... حظاً موفقاً! 🎯",
-            parse_mode="Markdown",
+    if not questions:
+        await query.message.edit_text(
+            "❌ تعذّر توليد الأسئلة.\n"
+            "حاول مرة أخرى أو ارفع ملفاً مختلفاً."
         )
-        return await _send_question(query.message.chat_id, context)
-
-    except Exception as e:
-        logger.error("خطأ في توليد الأسئلة: %s", e, exc_info=True)
-        await query.edit_message_text("❌ حدث خطأ أثناء توليد الأسئلة. حاول مرة أخرى.")
         return ConversationHandler.END
 
+    # تهيئة حالة الاختبار
+    context.user_data["questions"]     = questions
+    context.user_data["current_q"]     = 0
+    context.user_data["score"]         = 0
+    context.user_data["wrong_answers"] = []
 
-# ─── معالجة الإجابة ───────────────────────────────────────────────────────────
+    await query.message.edit_text(
+        f"✅ تم توليد {len(questions)} سؤال!\nلنبدأ الاختبار 🚀"
+    )
 
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
+    return await _send_question(update, context)
 
-    choice_idx = int(query.data.split("|")[1])
-    idx        = context.user_data["current_idx"]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. إرسال السؤال الحالي (دالة مساعدة)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _send_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """يرسل السؤال الحالي مع خيارات الإجابة."""
     questions  = context.user_data["questions"]
-    q          = questions[idx]
-    options    = q.get("options", [])
-    correct_idx = q.get("correct_index", 0)
-    is_correct  = (choice_idx == correct_idx)
+    current_q  = context.user_data["current_q"]
+    total      = len(questions)
 
-    if is_correct:
-        context.user_data["score"] += 1
-        result_text = "✅ *إجابة صحيحة!*"
-    else:
-        correct_text = options[correct_idx] if correct_idx < len(options) else "—"
-        result_text  = f"❌ *إجابة خاطئة!*\nالإجابة الصحيحة: _{correct_text}_"
-        context.user_data["wrong"].append({
-            "question":    q["question"],
-            "your_answer": options[choice_idx] if choice_idx < len(options) else "—",
-            "correct":     correct_text,
-        })
+    if current_q >= total:
+        return await _send_results(update, context)
 
-    # إضافة explanation إذا توفّر
-    explanation = q.get("explanation", "")
-    if explanation:
-        result_text += f"\n\n💡 _{explanation}_"
+    q    = questions[current_q]
+    text = q["question"]
+    opts = q["options"]
 
-    score = context.user_data["score"]
-    done  = idx + 1
-    total = len(questions)
-    await query.edit_message_text(
-        f"{result_text}\n\n_النتيجة حتى الآن: {score}/{done}_",
-        parse_mode="Markdown",
+    # بناء أزرار الخيارات
+    keyboard = [
+        [InlineKeyboardButton(f"{chr(0x31 + i)}️⃣ {opt}", callback_data=f"ans|{i}")]
+        for i, opt in enumerate(opts)
+    ]
+
+    msg = (
+        f"📝 *السؤال {current_q + 1} من {total}*\n\n"
+        f"{text}"
     )
 
-    context.user_data["current_idx"] += 1
-
-    if context.user_data["current_idx"] >= total:
-        return await _finish_quiz(query.message.chat_id, context)
-
-    return await _send_question(query.message.chat_id, context)
-
-
-# ─── دوال مساعدة ──────────────────────────────────────────────────────────────
-
-async def _send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
-    idx       = context.user_data["current_idx"]
-    questions = context.user_data["questions"]
-    total     = len(questions)
-    q         = questions[idx]
-    options   = q.get("options", [])
-
-    # تخطي الأسئلة بدون خيارات
-    if not options:
-        logger.warning("تخطي سؤال بدون خيارات — index %d", idx)
-        context.user_data["current_idx"] += 1
-        if context.user_data["current_idx"] >= total:
-            return await _finish_quiz(chat_id, context)
-        return await _send_question(chat_id, context)
-
-    ar_labels = ["أ", "ب", "ج", "د", "هـ"]
-    keyboard  = []
-    for i, opt in enumerate(options[:5]):
-        label    = ar_labels[i] if i < len(ar_labels) else str(i + 1)
-        btn_text = f"{label}) {opt[:55]}"
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"ans|{i}")])
-
-    # ✅ FIX: progress bar يعرض total بلوكات (كانت total-1)
-    filled   = "▓" * idx
-    current  = "🔵"
-    empty    = "░" * (total - idx - 1)
-    progress = filled + current + empty   # دائماً total بلوك
-
-    text = (
-        f"📝 *سؤال {idx + 1} من {total}*\n"
-        f"`{progress}`\n\n"
-        f"{q['question']}"
-    )
-
+    chat_id = update.effective_chat.id
     await context.bot.send_message(
         chat_id=chat_id,
-        text=text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        text=msg,
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return QUIZ
 
 
-async def _finish_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
-    score     = context.user_data["score"]
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. معالجة إجابة المستخدم
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """يتحقق من الإجابة ويعرض التغذية الراجعة ثم ينتقل للسؤال التالي."""
+    query = update.callback_query
+    await query.answer()
+
+    chosen_idx = int(query.data.split("|")[1])
+
     questions = context.user_data["questions"]
-    total     = len(questions)
-    subject   = context.user_data.get("subject", "غير محدد")
-    language  = context.user_data.get("language", "arabic")
-    wrong     = context.user_data.get("wrong", [])
-    # ✅ FIX: استخدام user_id المخزن (لا chat_id)
-    user_id   = context.user_data.get("user_id", chat_id)
-    pct       = round(score / total * 100) if total > 0 else 0
+    current_q = context.user_data["current_q"]
+    q         = questions[current_q]
+    correct_i = q["correct_index"]
+    opts      = q["options"]
 
-    if pct >= 90:
-        grade = "🏆 ممتاز"
-    elif pct >= 75:
-        grade = "🥈 جيد جداً"
-    elif pct >= 60:
-        grade = "🥉 جيد"
-    elif pct >= 50:
-        grade = "⚠️ مقبول"
+    if chosen_idx == correct_i:
+        context.user_data["score"] += 1
+        feedback = f"✅ *إجابة صحيحة!*"
     else:
-        grade = "❌ يحتاج مراجعة"
+        context.user_data["wrong_answers"].append({
+            "question":      q["question"],
+            "your_answer":   opts[chosen_idx],
+            "correct_answer":opts[correct_i],
+        })
+        feedback = (
+            f"❌ *إجابة خاطئة!*\n"
+            f"الإجابة الصحيحة: *{opts[correct_i]}*"
+        )
 
-    text = (
-        f"🎯 *انتهى الاختبار!*\n\n"
-        f"📚 المادة: *{subject}*\n"
-        f"✅ الصحيح: *{score}* / {total}\n"
-        f"📊 النسبة: *{pct}%*\n"
-        f"التقييم: {grade}\n"
+    # إضافة الشرح إن وُجد
+    explanation = q.get("explanation", "")
+    if explanation:
+        feedback += f"\n\n💡 _{explanation}_"
+
+    await query.message.reply_text(feedback, parse_mode="Markdown")
+
+    # الانتقال للسؤال التالي
+    context.user_data["current_q"] += 1
+    return await _send_question(update, context)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. عرض النتيجة النهائية
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _send_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """يعرض ملخص النتائج مع زرَّي إعادة الاختبار."""
+    score         = context.user_data.get("score", 0)
+    questions     = context.user_data.get("questions", [])
+    wrong_answers = context.user_data.get("wrong_answers", [])
+    subject       = context.user_data.get("subject", "")
+    total         = len(questions)
+    percentage    = round((score / total) * 100) if total else 0
+
+    # تحديد الإيموجي حسب النتيجة
+    if percentage >= 80:
+        emoji = "🏆"
+        grade = "ممتاز"
+    elif percentage >= 60:
+        emoji = "✅"
+        grade = "جيد"
+    elif percentage >= 40:
+        emoji = "⚠️"
+        grade = "مقبول"
+    else:
+        emoji = "❌"
+        grade = "يحتاج مراجعة"
+
+    result_text = (
+        f"{emoji} *نتيجة الاختبار*\n"
+        f"{'─' * 25}\n"
+        f"📚 المادة: {subject}\n"
+        f"🎯 النتيجة: {score} / {total} ({percentage}%)\n"
+        f"📊 التقدير: {grade}\n"
     )
 
-    # ملخص الأخطاء
-    if wrong:
-        shown = wrong[:MAX_WRONG_SHOWN]
-        text += f"\n\n❌ *الأخطاء ({len(wrong)} سؤال):*\n"
-        for i, w in enumerate(shown, 1):
-            q_short  = w["question"][:80] + ("…" if len(w["question"]) > 80 else "")
-            text    += f"\n*{i}.* {q_short}\n   ✅ _{w['correct']}_\n"
-        if len(wrong) > MAX_WRONG_SHOWN:
-            text += f"\n_...و {len(wrong) - MAX_WRONG_SHOWN} أخطاء أخرى_"
+    # عرض الإجابات الخاطئة إن وجدت
+    if wrong_answers:
+        result_text += f"\n❌ *الأسئلة التي أخطأت فيها ({len(wrong_answers)}):*\n"
+        for i, w in enumerate(wrong_answers, 1):
+            result_text += (
+                f"\n*{i}. {w['question']}*\n"
+                f"   إجابتك: {w['your_answer']}\n"
+                f"   الصحيحة: {w['correct_answer']}\n"
+            )
 
-    # زر اختبار جديد
-    keyboard = [[InlineKeyboardButton("🔄 اختبار جديد", callback_data="restart_quiz")]]
+    # ─── الأزرار ─────────────────────────────────────────────────────────────
+    # ✅ زر "أسئلة جديدة بنفس الملف" + زر "اختبار جديد بملف مختلف"
+    keyboard = [
+        [InlineKeyboardButton("🔁 أسئلة جديدة بنفس الملف", callback_data="retry_same_pdf")],
+        [InlineKeyboardButton("🔄 اختبار جديد (ملف مختلف)", callback_data="restart_quiz")],
+    ]
 
+    chat_id = update.effective_chat.id
     await context.bot.send_message(
         chat_id=chat_id,
-        text=text,
+        text=result_text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
-
-    # ✅ FIX: حفظ user_id الصحيح
-    db.save_result(user_id, subject, score, total, language)
-    logger.info("✅ نتيجة: user=%s subject=%s %d/%d (%d%%)", user_id, subject, score, total, pct)
-
-    context.user_data.clear()
     return ConversationHandler.END
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. زر "اختبار جديد" — يمسح كل شيء ويبدأ من الصفر
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def restart_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """يُشغَّل عند ضغط زر 'اختبار جديد' في نهاية الاختبار."""
+    """يمسح بيانات الجلسة ويطلب اسم المادة من جديد."""
     query = update.callback_query
     await query.answer()
-    await query.edit_message_reply_markup(reply_markup=None)
 
-    # إعادة تشغيل new_quiz عبر رسالة وهمية
-    user = update.effective_user
-    db.save_user(user.id, user.username)
     context.user_data.clear()
-    context.user_data["user_id"] = user.id
-
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=(
-            "📚 *اختبار جديد*\n\n"
-            "أرسل اسم المادة أو الموضوع الذي تريد الاختبار فيه:"
-        ),
+    await query.message.reply_text(
+        "🔄 *بدء اختبار جديد*\n\n"
+        "اكتب اسم المادة أو الموضوع:",
         parse_mode="Markdown",
     )
     return SUBJECT
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. ✅ زر "أسئلة جديدة بنفس الملف" — يُعيد الاختبار بدون رفع PDF مجدداً
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def retry_same_pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    يُعيد توليد أسئلة جديدة من نفس الـ PDF المحفوظ في user_data،
+    بدون الحاجة لإرسال الملف مرة أخرى.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    # ── استرجاع بيانات الجلسة المحفوظة ──────────────────────────────────────
+    pdf_text       = context.user_data.get("pdf_text")
+    language       = context.user_data.get("language", "arabic")
+    subject        = context.user_data.get("subject", "")
+    question_count = context.user_data.get("question_count", 5)
+
+    # إذا انتهت الجلسة (مثلاً بعد إعادة تشغيل البوت)
+    if not pdf_text:
+        await query.message.reply_text(
+            "⚠️ انتهت صلاحية الجلسة، يرجى رفع الملف مجدداً.\n"
+            "اكتب /newquiz للبدء."
+        )
+        return ConversationHandler.END
+
+    await query.message.reply_text(
+        f"⏳ جارٍ توليد {question_count} سؤال جديد من نفس الملف..."
+    )
+
+    # ── توليد أسئلة جديدة ────────────────────────────────────────────────────
+    questions = await generate_questions(
+        text_content=pdf_text,
+        count=question_count,
+        language=language,
+    )
+
+    if not questions:
+        keyboard = [
+            [InlineKeyboardButton("🔄 اختبار جديد (ملف مختلف)", callback_data="restart_quiz")]
+        ]
+        await query.message.reply_text(
+            "❌ تعذّر توليد أسئلة جديدة.\n"
+            "حاول مرة أخرى أو ارفع ملفاً مختلفاً.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return ConversationHandler.END
+
+    # ── إعادة تهيئة حالة الاختبار فقط (الملف والإعدادات تبقى محفوظة) ────────
+    context.user_data["questions"]     = questions
+    context.user_data["current_q"]     = 0
+    context.user_data["score"]         = 0
+    context.user_data["wrong_answers"] = []
+
+    await query.message.reply_text(
+        f"✅ تم توليد {len(questions)} سؤال جديد!\n"
+        f"📚 المادة: {subject}\n"
+        f"لنبدأ 🚀"
+    )
+
+    # ── إرسال السؤال الأول مباشرة ────────────────────────────────────────────
+    return await _send_question(update, context)
