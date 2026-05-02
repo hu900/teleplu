@@ -191,6 +191,7 @@ async def generate_questions(
             data = json.loads(raw)
             questions = data.get("questions", [])
 
+            # ── المرحلة 1: التحقق البنيوي ───────────────────────────────────
             valid = _validate_questions(questions)
 
             # إذا كنا في وضع extract وما وجدنا أسئلة → جرّب generate تلقائياً
@@ -200,8 +201,16 @@ async def generate_questions(
                 prompt = _choose_prompt(effective_mode, language, count, text_content)
                 continue
 
+            # ── المرحلة 2: فحص الجودة (تكرار، خيارات مكررة، hallucination) ─
+            valid, warnings = quality_check(valid)
+            if warnings:
+                logger.info(
+                    "⚠️ استُبعد %d سؤال بعد فحص الجودة — تبقى %d",
+                    len(warnings), len(valid),
+                )
+
             logger.info(
-                "✅ %d سؤال (طُلب %d، وضع=%s، محاولة=%d)",
+                "✅ %d سؤال جاهز للإرسال (طُلب %d، وضع=%s، محاولة=%d)",
                 len(valid), count, effective_mode, attempt,
             )
             return valid
@@ -221,36 +230,152 @@ async def generate_questions(
 
 # ─── التحقق من الأسئلة ───────────────────────────────────────────────────────
 
+# الحد الأدنى لطول السؤال (حرف)
+_MIN_QUESTION_LEN = 10
+# الحد الأدنى لطول كل خيار (حرف)
+_MIN_OPTION_LEN = 2
+# نسبة التشابه التي نعتبر عندها سؤالَين مكررَين (0-1)
+_DUP_SIMILARITY = 0.75
+
+
+def _normalize(text: str) -> str:
+    """تطبيع النص للمقارنة: أحرف صغيرة، حذف المسافات والتشكيل."""
+    import unicodedata
+    text = unicodedata.normalize("NFKC", text.lower())
+    # حذف التشكيل العربي
+    text = re.sub(r"[\u0610-\u061A\u064B-\u065F]", "", text)
+    # حذف علامات الترقيم والمسافات الزائدة
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _similarity(a: str, b: str) -> float:
+    """
+    نسبة التشابه بين نصّين بناءً على الكلمات المشتركة (Jaccard).
+    سريعة وكافية لكشف الأسئلة المكررة.
+    """
+    set_a = set(_normalize(a).split())
+    set_b = set(_normalize(b).split())
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union        = len(set_a | set_b)
+    return intersection / union if union else 0.0
+
+
 def _validate_questions(questions: list) -> list[dict]:
-    valid = []
+    """
+    المرحلة الأولى: التحقق البنيوي
+    - يتحقق من وجود السؤال والخيارات وصحة correct_index
+    - يُصلح الأخطاء الصغيرة تلقائياً (correct_index كنص، خيارات فارغة...)
+    """
+    valid: list[dict] = []
+
     for q in questions:
         if not isinstance(q, dict):
             continue
+
         question_text = (q.get("question") or "").strip()
         options       = q.get("options", [])
         correct_index = q.get("correct_index", 0)
 
-        if not question_text:
-            continue
-        if not isinstance(options, list) or len(options) < 2:
+        # ── فحص السؤال ──────────────────────────────────────────────────────
+        if len(question_text) < _MIN_QUESTION_LEN:
+            logger.debug("تجاهل سؤال قصير جداً: %r", question_text[:30])
             continue
 
-        # تحويل correct_index للرقم إذا جاء كنص
+        # ── فحص الخيارات ────────────────────────────────────────────────────
+        if not isinstance(options, list) or len(options) < 2:
+            logger.debug("تجاهل سؤال بخيارات غير كافية")
+            continue
+
+        cleaned_options = [str(o).strip() for o in options if str(o).strip()]
+        if len(cleaned_options) < 2:
+            continue
+
+        # حذف الخيارات القصيرة جداً
+        cleaned_options = [o for o in cleaned_options if len(o) >= _MIN_OPTION_LEN]
+        if len(cleaned_options) < 2:
+            logger.debug("تجاهل سؤال بعد حذف الخيارات القصيرة")
+            continue
+
+        # ── تصحيح correct_index ──────────────────────────────────────────────
         try:
             correct_index = int(correct_index)
         except (ValueError, TypeError):
             correct_index = 0
-        correct_index = max(0, min(correct_index, len(options) - 1))
+        correct_index = max(0, min(correct_index, len(cleaned_options) - 1))
 
         item: dict = {
             "question":      question_text,
-            "options":       [str(o).strip() for o in options],
+            "options":       cleaned_options,
             "correct_index": correct_index,
         }
-        # explanation اختيارية
         explanation = (q.get("explanation") or "").strip()
         if explanation:
             item["explanation"] = explanation
 
         valid.append(item)
+
     return valid
+
+
+def quality_check(questions: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    المرحلة الثانية: فحص الجودة بعد التحقق البنيوي.
+    تُعيد: (الأسئلة_الجيدة, قائمة_التحذيرات)
+
+    الفحوصات:
+      1. خيارات مكررة داخل نفس السؤال
+      2. الإجابة الصحيحة هي نفسها أحد الخيارات الأخرى (ازدواج)
+      3. أسئلة مكررة أو شبه مكررة (Jaccard similarity)
+      4. السؤال والإجابة الصحيحة متطابقان (hallucination واضح)
+      5. خيار الإجابة فارغ أو جداً قصير
+    """
+    passed:   list[dict] = []
+    warnings: list[str]  = []
+    seen_questions: list[str] = []   # لكشف التكرار
+
+    for i, q in enumerate(questions, 1):
+        q_text    = q["question"]
+        options   = q["options"]
+        correct_i = q["correct_index"]
+        correct_t = options[correct_i] if correct_i < len(options) else ""
+        issues: list[str] = []
+
+        # ── 1. خيارات مكررة داخل السؤال ─────────────────────────────────────
+        norm_opts = [_normalize(o) for o in options]
+        if len(norm_opts) != len(set(norm_opts)):
+            issues.append("خيارات مكررة")
+
+        # ── 2. الإجابة الصحيحة فارغة أو قصيرة جداً ──────────────────────────
+        if len(correct_t.strip()) < _MIN_OPTION_LEN:
+            issues.append("الإجابة الصحيحة فارغة أو قصيرة")
+
+        # ── 3. السؤال متطابق مع الإجابة (hallucination) ──────────────────────
+        if _similarity(q_text, correct_t) > 0.9:
+            issues.append("السؤال والإجابة متطابقان تقريباً")
+
+        # ── 4. تكرار مع سؤال سابق ────────────────────────────────────────────
+        is_dup = False
+        for seen in seen_questions:
+            if _similarity(q_text, seen) >= _DUP_SIMILARITY:
+                issues.append("مكرر مع سؤال آخر")
+                is_dup = True
+                break
+
+        if issues:
+            msg = f"سؤال {i} استُبعد ({' | '.join(issues)}): {q_text[:50]}…"
+            warnings.append(msg)
+            logger.warning("🔍 %s", msg)
+            continue
+
+        seen_questions.append(q_text)
+        passed.append(q)
+
+    if warnings:
+        logger.info(
+            "✅ جودة الأسئلة: %d مقبول، %d مستبعد",
+            len(passed), len(warnings),
+        )
+    return passed, warnings
