@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 
-from services.language_service import detect_language
+from services.language_service import detect_text_language as detect_language
 from services.pdf_service import extract_text_from_pdf
 from services.quiz_service import generate_questions
 
