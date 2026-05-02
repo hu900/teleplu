@@ -1,0 +1,8 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python main.py"
+restartPolicyType = "always"
+restartPolicyMaxRetries = 5
+numReplicas = 1  # ✅ FIX: منع تشغيل أكثر من instance واحد (يحل Telegram Conflict error)
