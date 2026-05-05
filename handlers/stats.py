@@ -1,52 +1,59 @@
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from db import get_stats, get_subject_stats
+from db import _exec
+
+ADMIN_USER_ID = 123456789  # غيّرها إلى رقمك في تيليجرام
 
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    tg_user_id = user.id
 
-    stats = get_stats(tg_user_id)
-    subjects = get_subject_stats(tg_user_id)
+    if not user or user.id != ADMIN_USER_ID:
+        return
 
-    total_quizzes = stats.get("total_quizzes", 0) or 0
-    total_correct = stats.get("total_correct", 0) or 0
-    total_questions = stats.get("total_questions", 0) or 0
-    avg_pct = stats.get("avg_pct")
-    best_pct = stats.get("best_pct")
-    worst_pct = stats.get("worst_pct")
+    total_users = _exec("SELECT COUNT(*) AS cnt FROM users")[0]["cnt"]
+    total_quizzes = _exec("SELECT COUNT(*) AS cnt FROM results")[0]["cnt"]
 
-    avg_pct_text = f"{avg_pct}%" if avg_pct is not None else "—"
-    best_pct_text = f"{best_pct}%" if best_pct is not None else "—"
-    worst_pct_text = f"{worst_pct}%" if worst_pct is not None else "—"
+    today_users = _exec(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM users
+        WHERE date(created_at) = date('now', 'localtime')
+        """
+    )[0]["cnt"]
+
+    today_quizzes = _exec(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM results
+        WHERE date(date) = date('now', 'localtime')
+        """
+    )[0]["cnt"]
+
+    top_subjects = _exec(
+        """
+        SELECT subject, COUNT(*) AS cnt
+        FROM results
+        GROUP BY subject
+        ORDER BY cnt DESC
+        LIMIT 5
+        """
+    )
 
     lines = [
-        "📊 إحصائياتك",
+        "📊 إحصائيات البوت",
         "",
-        f"عدد الاختبارات: {total_quizzes}",
-        f"إجمالي الإجابات الصحيحة: {total_correct}",
-        f"إجمالي الأسئلة: {total_questions}",
-        f"متوسط الأداء: {avg_pct_text}",
-        f"أفضل نتيجة: {best_pct_text}",
-        f"أقل نتيجة: {worst_pct_text}",
+        f"عدد المستخدمين: {total_users}",
+        f"عدد الاختبارات المنفذة: {total_quizzes}",
+        f"مستخدمو اليوم: {today_users}",
+        f"اختبارات اليوم: {today_quizzes}",
     ]
 
-    if subjects:
+    if top_subjects:
         lines.append("")
-        lines.append("📚 حسب المادة:")
-        for item in subjects[:5]:
-            subject = item.get("subject", "بدون اسم")
-            attempts = item.get("attempts", 0)
-            subj_avg = item.get("avg_pct")
-            subj_best = item.get("best_pct")
-
-            subj_avg_text = f"{subj_avg}%" if subj_avg is not None else "—"
-            subj_best_text = f"{subj_best}%" if subj_best is not None else "—"
-
-            lines.append(
-                f"- {subject}: {attempts} محاولة، متوسط {subj_avg_text}، أفضل {subj_best_text}"
-            )
+        lines.append("📚 أكثر المواد استخدامًا:")
+        for row in top_subjects:
+            lines.append(f"- {row['subject']}: {row['cnt']}")
 
     await update.message.reply_text("\n".join(lines))
