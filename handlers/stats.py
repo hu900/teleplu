@@ -1,15 +1,14 @@
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from config import BOT_ADMIN_IDS
 from db import _exec
-
-ADMIN_USER_ID = 123456789  # غيّرها إلى رقمك في تيليجرام
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    if not user or user.id != ADMIN_USER_ID:
+    if not user or user.id not in BOT_ADMIN_IDS:
         return
 
     total_users = _exec("SELECT COUNT(*) AS cnt FROM users")[0]["cnt"]
