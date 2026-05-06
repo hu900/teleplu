@@ -41,6 +41,7 @@ from handlers.quiz import (
 )
 from handlers.reports import reports
 from handlers.start import start
+from handlers.stats import admin_stats
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -106,6 +107,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reports", reports))
+    app.add_handler(CommandHandler("stats", admin_stats))
     app.add_handler(quiz_conv)
     app.add_handler(CommandHandler("cancel", cancel_command))
 
